@@ -155,6 +155,8 @@ KNOWN_NAMES = {
     'AL172024': 'PATTY',
     'AL182024': 'RAFAEL',
     'AL192024': 'SARA',
+    # 2026
+    'AL012026': 'ARTHUR',
 }
 
 # Category thresholds in knots (Saffir-Simpson + extensions)
@@ -326,24 +328,53 @@ def build_hurdat2_name_map(year):
 # Live NHC data via CurrentStorms.json + ATCF
 # ---------------------------------------------------------------------------
 
+# Ordinal number words used by NHC for unnamed Potential Tropical Cyclones
+_ORDINAL_NAMES = {
+    "ONE","TWO","THREE","FOUR","FIVE","SIX","SEVEN","EIGHT","NINE","TEN",
+    "ELEVEN","TWELVE","THIRTEEN","FOURTEEN","FIFTEEN","SIXTEEN",
+    "SEVENTEEN","EIGHTEEN","NINETEEN","TWENTY",
+    "TWENTY-ONE","TWENTY-TWO","TWENTY-THREE","TWENTY-FOUR","TWENTY-FIVE",
+}
+
+def hours_since_dtg(dtg):
+    """Return hours elapsed since an ATCF DTG string (YYYYMMDDHH or YYYYMMDD).
+    Returns 0 on parse error (so the storm is NOT skipped on bad data).
+    """
+    try:
+        t = datetime.datetime.strptime(str(dtg)[:10], "%Y%m%d%H")
+        t = t.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - t).total_seconds() / 3600.0
+    except Exception:
+        return 0.0
+
+
 def get_active_storm_ids_nhc():
     """
-    Fetch NHC CurrentStorms.json and extract active storm wallet IDs.
-    Returns list of storm IDs like ['AL052026', 'EP022026'].
+    Fetch NHC CurrentStorms.json and extract active storm IDs.
+    Returns list of (storm_id, json_name) tuples like [('AL052026', 'HELENE')].
+
+    NOTE: NHC's JSON `lastUpdate` field and `classification` field can lag
+    behind the actual storm state by many hours -- notably, storms that begin
+    as Potential Tropical Cyclones (classification='PC') may never have their
+    JSON entry updated once they are upgraded to TS/HU status.  Do NOT use
+    the JSON metadata for age-gating or classification filtering; use the ATCF
+    best-track file for that instead.
     """
     data = fetch_url(NHC_CURRENT_STORMS_URL)
     if not data:
         return []
     try:
         storms_json = json.loads(data)
-        ids = []
-        # Structure: {"activeStorms": [{"id": "AL052026", "name": "HELENE", ...}, ...]}
+        result = []
         active = storms_json.get("activeStorms", [])
         for storm in active:
-            storm_id = storm.get("id", "")
-            if storm_id:
-                ids.append(storm_id.upper())
-        return ids
+            storm_id = storm.get("id", "").upper()
+            if not storm_id:
+                continue
+            json_name = storm.get("name", "").upper()
+            result.append((storm_id, json_name))
+        return result
     except json.JSONDecodeError as e:
         print(f"# WARNING: JSON parse error: {e}", file=sys.stderr)
         return []
@@ -398,20 +429,28 @@ def fetch_storm_forecast(storm_id):
 # Storm name lookup
 # ---------------------------------------------------------------------------
 
-def get_storm_name_from_json(storm_id):
-    """Try to get human-readable storm name from CurrentStorms.json cache."""
-    # We re-fetch here; in production OHB would cache this
-    data = fetch_url(NHC_CURRENT_STORMS_URL)
-    if not data:
-        return storm_id
-    try:
-        storms_json = json.loads(data)
-        for storm in storms_json.get("activeStorms", []):
-            if storm.get("id", "").upper() == storm_id.upper():
-                name = storm.get("name", storm_id)
-                return name.upper()
-    except Exception:
-        pass
+def resolve_storm_name(storm_id, json_name):
+    """
+    Return the best human-readable name for a storm.
+
+    Priority:
+      1. KNOWN_NAMES lookup by storm ID (statically maintained table)
+      2. JSON name, but ONLY if it is not an NHC ordinal placeholder
+         ("One", "Two", ... used for Potential Tropical Cyclones before naming)
+      3. Storm ID itself as fallback (e.g. "AL012026")
+
+    The JSON `name` field is unreliable for storms that begin as Potential
+    Tropical Cyclones: NHC often fails to update the JSON after upgrading the
+    system to a named tropical storm, leaving ordinal names like "One" even
+    after the storm has been christened.
+    """
+    # 1. static table takes priority
+    if storm_id in KNOWN_NAMES:
+        return KNOWN_NAMES[storm_id]
+    # 2. use JSON name only when it is a real name, not an ordinal placeholder
+    if json_name and json_name not in _ORDINAL_NAMES:
+        return json_name
+    # 3. fall back to the storm ID itself
     return storm_id
 
 
@@ -736,15 +775,13 @@ def get_archive_output(year):
 def get_live_output():
     """Fetch all currently active NHC storms and return output lines."""
     lines = []
-    storm_ids = get_active_storm_ids_nhc()
+    storm_entries = get_active_storm_ids_nhc()   # list of (storm_id, json_name) tuples
 
     all_storm_lines = []
-    for storm_id in storm_ids:
+    nhc_active = 0
+
+    for storm_id, json_name in storm_entries:
         basin = storm_id[:2]
-        name  = get_storm_name_from_json(storm_id)
-        # fall back to known names table if JSON lookup failed
-        if name == storm_id:
-            name = KNOWN_NAMES.get(storm_id, storm_id)
 
         # Get current position from best track
         btk_records = fetch_storm_atcf(storm_id)
@@ -752,10 +789,24 @@ def get_live_output():
             print(f"# WARNING: no ATCF data for {storm_id}", file=sys.stderr)
             continue
 
-        # Most recent BEST track entry = current position
         current = btk_records[-1]
-        advisory = current['dtg']  # use DTG as advisory reference
+
+        # Age-gate on the BTK fix timestamp, NOT the JSON lastUpdate field.
+        # NHC's JSON lastUpdate is unreliable: for storms that begin as
+        # Potential Tropical Cyclones (classification='PC'), NHC often never
+        # updates the JSON entry after the system is upgraded to a named TS/HU.
+        # This caused TS Arthur (AL012026) to show a 44h-old JSON timestamp
+        # even while actively issuing advisories -- identical to the age seen
+        # on legitimately dead JTWC storms, causing it to be silently skipped.
+        btk_age_h = hours_since_dtg(current['dtg'])
+        if btk_age_h > NHC_MAX_AGE_H:
+            print(f"# Skipping {storm_id}: last BTK fix {btk_age_h:.0f}h old", file=sys.stderr)
+            continue
+
+        advisory = current['dtg']
         stype, cat = wind_to_category(current['vmax'], basin)
+        name = resolve_storm_name(storm_id, json_name)
+        nhc_active += 1
 
         # Emit current position as tau=0
         all_storm_lines.append(
@@ -774,7 +825,7 @@ def get_live_output():
                 f"{rec['vmax']},{rec['tau']},{advisory}"
             )
 
-    # --- JTWC: W.Pacific / N.Indian / S.Hemisphere (not covered by NHC) ---
+
     jtwc_ids = get_active_storm_ids_jtwc()
     jtwc_active = 0
     for storm_id in jtwc_ids:
@@ -811,7 +862,7 @@ def get_live_output():
             )
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-    n = len(storm_ids) + jtwc_active
+    n = nhc_active + jtwc_active
     lines.append(f"# TROPICAL CYCLONES {n} storms as of {now} UTC")
     lines.extend(all_storm_lines)
     return lines
