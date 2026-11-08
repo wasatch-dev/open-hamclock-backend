@@ -98,6 +98,17 @@ AMSAT_META="${AMSAT_META:-/opt/hamclock-backend/tle/amsat-latest.meta}"
 XRAY_META="${XRAY_META:-/opt/hamclock-backend/cache/xray-upstream.meta}"
 XRAY_META_MAX_AGE="${XRAY_META_MAX_AGE:-3600}"
 
+# kc2g propagation page: the MUF real-time maps (map-*-MUF-RT.*) are built from
+# GIRO ionosonde data.  When GIRO stops delivering, prop.kc2g.com shows a notice
+# ("Data is stale ... No data has been received from GIRO for more than N hours...").
+# We scrape it so the MUF-RT rows go STALE even though the map files themselves
+# are regenerated on schedule.  Set KC2G_CHECK=0 to disable.
+KC2G_CHECK="1"
+KC2G_URL="${KC2G_URL:-https://prop.kc2g.com/}"
+KC2G_TIMEOUT="${KC2G_TIMEOUT:-10}"
+# Case-insensitive extended regex matched against the page text
+KC2G_STALE_REGEX="${KC2G_STALE_REGEX:-Data is stale|No data has been received from GIRO}"
+
 # Determine the central mirror host
 MIRROR_HOST="${MIRROR:-ohb.hamclock.app}"
 
@@ -295,6 +306,32 @@ should_ignore() {
 
 NOW=$(date -u "+%Y-%m-%d %H:%M:%S")
 NOW_EPOCH=$(date -u +%s)
+
+# ---- kc2g data notice (MUF-RT maps) ------------------------------------------
+# KC2G_STALE: 1 = notice present, 0 = page fetched and no notice, -1 = unknown
+# (fetch failed / disabled; never marks anything stale on its own).
+KC2G_STALE=-1
+KC2G_NOTICE=""
+KC2G_LAST_DATA=""
+if [ "$KC2G_CHECK" = "1" ]; then
+    kc2g_html=$(curl -A "${UA:-OHB-generate/1.0}" -sSL --max-time "$KC2G_TIMEOUT" "$KC2G_URL" 2>/dev/null || true)
+    if [ -n "$kc2g_html" ] && grep -qi '<html\|<body\|<title' <<<"$kc2g_html"; then
+        # strip tags, collapse whitespace
+        kc2g_text=$(sed -e 's/<[^>]*>/ /g' -e 's/&nbsp;/ /g' <<<"$kc2g_html" | tr -s ' \t\r\n' ' ')
+        if grep -qiE "$KC2G_STALE_REGEX" <<<"$kc2g_text"; then
+            KC2G_STALE=1
+            # Pull the sentence(s) of the notice for display, e.g.
+            # "No data has been received from GIRO for more than 3 hours. Last data was at ..."
+            KC2G_NOTICE=$(grep -oiE 'No data has been received from GIRO[^.]*\.( Last data was at [0-9: -]+ ?UTC)?' <<<"$kc2g_text" | head -n1)
+            KC2G_LAST_DATA=$(grep -oiE 'Last data was at [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}(:[0-9]{2})?' <<<"$kc2g_text" | head -n1 | sed 's/^[^0-9]*//')
+            [ -z "$KC2G_NOTICE" ] && KC2G_NOTICE="Data is stale (notice on prop.kc2g.com)"
+            # keep it safe for HTML/JSON embedding
+            KC2G_NOTICE=$(tr -cd 'A-Za-z0-9 .,:()/_-' <<<"$KC2G_NOTICE")
+        else
+            KC2G_STALE=0
+        fi
+    fi
+fi
 
 # ── Remote Alpha Status ─────────────────────────────────────────────────────
 declare -A REMOTE_FILE_MOD=()
@@ -598,6 +635,17 @@ emit_file_row() {
             fi
             name_extra="<br><span style='opacity:.65;font-size:.85em'>${x_note}</span>"
         fi
+    fi
+
+    # MUF-RT maps are derived from GIRO data.  If prop.kc2g.com is showing its
+    # "Data is stale / No data received from GIRO" notice, the map files may be
+    # freshly written but are low quality, so report STALE regardless of mtime.
+    if [ "$label" = "map" ] && [ "$KC2G_STALE" = "1" ] && [[ "$filename" == map-[DN]-*-MUF-RT.* ]]; then
+        status_class="stale"
+        status_text="STALE"
+        name_extra="<br><span style='opacity:.65;font-size:.85em'>${KC2G_NOTICE:-GIRO data stale per prop.kc2g.com}</span>"
+        json_extra=$(printf ',\n      "upstream_ok": false,\n      "upstream_source": "prop.kc2g.com (GIRO)"')
+        [ -n "$KC2G_LAST_DATA" ] && json_extra+=$(printf ',\n      "last_valid_sample_utc": "%s"' "$KC2G_LAST_DATA")
     fi
 
     # Update summary tallies in the current shell
